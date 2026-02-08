@@ -1,0 +1,400 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.util.List;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+/* ============================================================
+ *  FractalApp: UI shell around a Swing-free FractalGenerator
+ * ============================================================ */
+public class FractalAppExt {
+
+    enum FractalType { TREE, MANDELBROT, JULIA }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            JFrame f = new JFrame("Fractal Playground — Tree / Mandelbrot / Julia");
+            f.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+
+            FractalPanel canvas = new FractalPanel(1024, 768);
+            ControlPanel controls = new ControlPanel(canvas);
+
+            f.setLayout(new BorderLayout());
+            f.add(canvas, BorderLayout.CENTER);
+            f.add(controls, BorderLayout.SOUTH);
+
+            // Use a sensible initial size; panel will stretch with the frame.
+            f.setSize(1000, 720);
+            f.setLocationByPlatform(true);
+            f.setVisible(true);
+        });
+    }
+
+    /* ===================== UI: Canvas ===================== */
+    static final class FractalPanel extends JPanel {
+        private volatile BufferedImage image;                 // for sets
+        private final java.util.List<FractalGenerator.Line> lines =
+                Collections.synchronizedList(new ArrayList<>()); // for tree
+        private volatile FractalGenerator.FractalControl current;
+        private FractalType type = FractalType.TREE;
+        private javax.swing.Timer timer;
+
+        // view/params
+        private int iterOrDepth = 500;
+        private double juliaRe = -0.8, juliaIm = 0.156;
+        private double centerX = -0.5, centerY = 0.0, scale = 3.0;
+        private double treeAngleDeg = 22.0;
+
+        FractalPanel(int w, int h) {
+            setPreferredSize(new Dimension(w, h));
+            setBackground(Color.WHITE);
+
+            // On resize, we don’t auto-regenerate (to avoid surprises),
+            // but the next Generate will use the new size.
+            addComponentListener(new ComponentAdapter() {
+                @Override public void componentShown(ComponentEvent e) { repaint(); }
+                @Override public void componentResized(ComponentEvent e) { repaint(); }
+            });
+            
+        }
+
+        void setType(FractalType t) { this.type = t; }
+        void setIterOrDepth(int v) { this.iterOrDepth = v; }
+        void setJulia(double re, double im) { this.juliaRe = re; this.juliaIm = im; }
+        void setView(double cx, double cy, double sc) { this.centerX = cx; this.centerY = cy; this.scale = sc; }
+        void setTree(double angleDeg, double scale) { this.treeAngleDeg = angleDeg; this.scale = scale; }
+
+        /** Start generation based on current UI params; returns the handle for awaiting/cancel. */
+        void generate(Consumer<String> updateStatus) {
+            if (current != null) { cancelCurrent(updateStatus); return; }
+
+            final int w = Math.max(1, getWidth());
+            final int h = Math.max(1, getHeight());
+
+            current = FractalGenerator.generate(
+                type,
+                w, h,
+                Math.max(1, iterOrDepth),
+                treeAngleDeg,
+                Math.max(10, iterOrDepth),
+                        centerX, centerY, Math.max(1e-12, scale),
+                        juliaRe, juliaIm
+            );
+
+
+            // Prepare drawing buffers
+            if (type == FractalType.TREE) {
+                image = null;
+                lines.clear();
+            } else {
+                lines.clear();
+                image = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+            }
+            timer = new javax.swing.Timer(100, e -> {
+                List<Object> polled = FractalGenerator.update(current);
+                for (Object o : polled) {
+                    if (type == FractalType.TREE) {
+                        FractalGenerator.Line l = (FractalGenerator.Line)o;
+                        lines.add(l);
+                    } else {
+                        FractalGenerator.RowInfo ri = (FractalGenerator.RowInfo)o;
+                        image.getRaster().setDataElements(0, ri.y, w, 1, ri.row);
+                    }
+                }
+                SwingUtilities.invokeLater(this::repaint);
+                if (current.pool.isTerminated()) {
+                    SwingUtilities.invokeLater(() -> {
+                        updateStatus.accept(current.isCancelled.get() ? "Cancelled." : "Rendered.");
+                        ((javax.swing.Timer)e.getSource()).stop();
+                        current = null;
+                    });
+                }
+            });
+            timer.start();
+        }
+
+        void cancelCurrent(Consumer<String> updateStatus) {
+            FractalGenerator.FractalControl h = current;
+            if (h != null) {
+                updateStatus.accept("Cancelling...");
+                h.isCancelled.set(true);
+            }
+        }
+
+        @Override protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+            if (type == FractalType.TREE) {
+                synchronized (lines) {
+                    for (FractalGenerator.Line ln : lines) {
+                        g2.setColor(new Color(ln.argb, true));
+                        g2.drawLine(ln.x1, ln.y1, ln.x2, ln.y2);
+                    }
+                }
+            } else if (image != null) {
+                g2.drawImage(image, 0, 0, null);
+            }
+            g2.dispose();
+        }
+    }
+
+    /* ===================== UI: Controls ===================== */
+    static final class ControlPanel extends JPanel {
+        private final JComboBox<FractalType> typeBox = new JComboBox<>(FractalType.values());
+        private final JTextField iterDepth = new JTextField("500", 3);
+        private final JTextField juliaRe = new JTextField("-0.8", 3);
+        private final JTextField juliaIm = new JTextField("0.156", 3);
+        private final JTextField angleDeg = new JTextField("22", 2);
+        private final JTextField scaleField = new JTextField("3.0", 3);
+        private final JTextField centerX = new JTextField("-0.5", 3);
+        private final JTextField centerY = new JTextField("0.0", 3);
+        private final JButton generateBtn = new JButton("Generate");
+        private final JButton cancelBtn = new JButton("Cancel");
+        private final JLabel status = new JLabel(" ");
+
+        private final FractalPanel canvas;
+
+        ControlPanel(FractalPanel canvas) {
+            this.canvas = canvas;
+
+            setLayout(new GridBagLayout());
+            GridBagConstraints c = new GridBagConstraints();
+            c.insets = new Insets(4, 6, 4, 6);
+            c.gridy = 0; c.gridx = 0; c.anchor = GridBagConstraints.WEST;
+
+            add(new JLabel("Fractal:"), c); c.gridx++;
+            add(typeBox, c); c.gridx++;
+
+            add(new JLabel("Iter/Depth:"), c); c.gridx++;
+            add(iterDepth, c); c.gridx++;
+
+            add(new JLabel("Julia c (re, im):"), c); c.gridx++;
+            add(juliaRe, c); c.gridx++;
+            add(juliaIm, c); c.gridx++;
+
+            add(new JLabel("View scale:"), c); c.gridx++;
+            add(scaleField, c); c.gridx++;
+
+            add(new JLabel("Center (x,y):"), c); c.gridx++;
+            add(centerX, c); c.gridx++;
+            add(centerY, c); c.gridx++;
+
+            c.gridx++; add(generateBtn, c); c.gridx++;
+            add(cancelBtn, c);
+
+            c.gridy = 1; c.gridx = 0; c.gridwidth = 12; c.fill = GridBagConstraints.HORIZONTAL;
+            add(status, c);
+
+            syncFieldVisibility((FractalType) typeBox.getSelectedItem());
+
+            typeBox.addActionListener(e -> {
+                FractalType t = (FractalType) typeBox.getSelectedItem();
+                canvas.setType(t);
+                syncFieldVisibility(t);
+            });
+
+            generateBtn.addActionListener(e -> onGenerate());
+            cancelBtn.addActionListener(e -> {
+                canvas.cancelCurrent(s -> status.setText(s));                
+            });
+        }
+
+        private void onGenerate() {
+            try {
+                FractalType t = (FractalType) typeBox.getSelectedItem();
+                int v = Integer.parseInt(iterDepth.getText().trim());
+                if (t == FractalType.TREE) {
+                    canvas.setIterOrDepth(Math.max(1, v));
+                    double ang = Double.parseDouble(angleDeg.getText().trim());
+                    double sc = Double.parseDouble(scaleField.getText().trim());
+                    canvas.setTree(ang, sc);
+                } else {
+                    canvas.setIterOrDepth(Math.max(10, v));
+                    double cx = Double.parseDouble(centerX.getText().trim());
+                    double cy = Double.parseDouble(centerY.getText().trim());
+                    double sc = Double.parseDouble(scaleField.getText().trim());
+                    canvas.setView(cx, cy, Math.max(1e-12, sc));
+                    if (t == FractalType.JULIA) {
+                        double re = Double.parseDouble(juliaRe.getText().trim());
+                        double im = Double.parseDouble(juliaIm.getText().trim());
+                        canvas.setJulia(re, im);
+                    }
+                }
+
+                status.setText("Rendering…");
+                canvas.generate((s) -> status.setText(s));
+
+
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(this, "Please enter valid numeric parameters.", "Input Error", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+
+        private void syncFieldVisibility(FractalType t) {
+            boolean isTree = (t == FractalType.TREE);
+            juliaRe.setEnabled(t == FractalType.JULIA);
+            juliaIm.setEnabled(t == FractalType.JULIA);
+            angleDeg.setEnabled(isTree);
+            centerX.setEnabled(!isTree);
+            centerY.setEnabled(!isTree);
+            centerX.setText(t == FractalType.MANDELBROT ? "-0.5" : "0.0");
+            scaleField.setText(isTree ? "0.8" : "3.0");
+            iterDepth.setText(isTree ? "11" : "500");
+        }
+    }
+
+    /* ============================================================
+     *  FractalGenerator: Swing-free logic + concurrency
+     *    - Uses wait/notify to signal completion
+     *    - Provides cancel + awaitDone
+     *    - Reports progress via simple consumers
+     * ============================================================ */
+    static final class FractalGenerator {
+        private static volatile boolean slowMode = false; // for demo/testing
+
+        /* -------- Shared types (no AWT/Swing here) -------- */
+        public record Line(int x1, int y1, int x2, int y2, int argb) {}
+        public record FractalControl(ExecutorService pool, AtomicBoolean isCancelled, BlockingQueue<Object> queue, AtomicInteger tasks) {}
+
+        public static List<Object> update(FractalControl handle) {
+            List<Object> polled = new ArrayList<>();
+            handle.queue.drainTo(polled);
+            if (handle.tasks.get() == 0)
+                if (!handle.pool.isTerminated()) handle.pool.shutdownNow();
+            return polled;
+        }
+
+        /* ===== Fractal Tree ===== */
+        public static FractalControl generate(
+                FractalType type,
+                int w, int h, int depth, double angleDeg,
+                int maxIter,
+                double centerX, double centerY, double scale,
+                double juliaRe, double juliaIm)
+        {
+            final AtomicInteger tasks = new AtomicInteger(1);  // wait/notify counter
+            final AtomicBoolean cancelled = new AtomicBoolean(false);
+
+            final ExecutorService pool = Executors.newFixedThreadPool(
+                    Math.max(1, Runtime.getRuntime().availableProcessors()));
+            BlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+            final FractalControl handle = new FractalControl(pool, cancelled, queue, tasks);
+            pool.submit(() -> {
+                // Bootstrap branch
+                if (type == FractalType.TREE) {
+                    double length = Math.min(w, h) * 0.18;
+                    submitBranch(handle, w/2, (int)(h*0.9), -90.0, length, depth, angleDeg, scale);
+                } else {
+                    generateSet(handle, type, w, h, maxIter, centerX, centerY, scale, juliaRe, juliaIm);
+                }
+                tasks.decrementAndGet();
+            });
+
+            return handle;
+        }
+
+        private static void submitBranch(
+                FractalControl handle,
+                int x, int y, double angle, double length, int height,
+                double angleDeg, double scale)
+        {
+            if (slowMode) { try {Thread.sleep(100);} catch (InterruptedException ie) { return; } }
+            if (height == 0 || handle.isCancelled.get()) return;
+
+            int x2 = x + (int)Math.round(Math.cos(Math.toRadians(angle)) * length);
+            int y2 = y + (int)Math.round(Math.sin(Math.toRadians(angle)) * length);
+
+            int argb = (height < 5) ? new Color(20, 140, 20).getRGB()
+                                    : new Color(40, 40, 40).getRGB();
+            try {
+                handle.queue.put(new Line(x, y, x2, y2, argb));
+            } catch (InterruptedException ie) {}
+
+            double nextLen = length * scale;
+            // Left
+            handle.tasks.incrementAndGet();
+            handle.pool.submit(() -> {
+                submitBranch(handle, x2, y2, angle - angleDeg, nextLen, height - 1, angleDeg, scale);
+                handle.tasks.decrementAndGet();
+            });
+            // Right (tail-call-ish)
+            submitBranch(handle, x2, y2, angle + angleDeg, nextLen, height - 1, angleDeg, scale);
+        }
+
+        record RowInfo(int y, int[] row) {}
+
+        /* ===== Mandelbrot / Julia ===== */
+        static void generateSet(FractalControl handle, FractalType type, int w, int h, int maxIter,
+                double centerX, double centerY, double scale,
+                double juliaRe, double juliaIm) {
+            final double scaleX = scale;
+            final double scaleY = scale * h / (double) w;
+            final double xmin = centerX - scaleX / 2.0;
+            final double ymin = centerY - scaleY / 2.0;
+
+            for (int y = 0; y < h; y++) {
+                final int rowY = y;
+                handle.tasks.incrementAndGet();
+                handle.pool.submit(() -> {
+                    if (handle.isCancelled.get()) { handle.tasks.decrementAndGet(); return; }
+                    int[] row = new int[w];
+                    double imag = ymin + (rowY / (double) (h - 1)) * scaleY;
+                    for (int x = 0; x < w; x++) {
+                        double real = xmin + (x / (double) (w - 1)) * scaleX;
+                        row[x] = switch (type) {
+                            case MANDELBROT -> mandelbrot(real, imag, maxIter);
+                            case JULIA -> julia(real, imag, juliaRe, juliaIm, maxIter);
+                            default -> 0x000000; // should not happen
+                        };
+                    }
+                    try {
+                        handle.queue.put(new RowInfo(rowY, row));
+                    } catch (InterruptedException ie) {}
+                    handle.tasks.decrementAndGet();
+                });
+            }
+        }
+
+        /* ===== Coloring + Iterations (logic only) ===== */
+        private static int mandelbrot(double cr, double ci, int maxIter) {
+            double zr = 0, zi = 0;
+            double zr2 = 0, zi2 = 0;
+            int i = 0;
+            while (i < maxIter && (zr2 + zi2) <= 4.0) {
+                zi = 2 * zr * zi + ci;
+                zr = zr2 - zi2 + cr;
+                zr2 = zr * zr; zi2 = zi * zi;
+                i++;
+            }
+            return palette(i, maxIter, zr, zi);
+        }
+
+        private static int julia(double zr, double zi, double cr, double ci, int maxIter) {
+            int i = 0;
+            double zr2 = zr * zr, zi2 = zi * zi;
+            while (i < maxIter && (zr2 + zi2) <= 4.0) {
+                double nzr = zr2 - zi2 + cr;
+                double nzi = 2 * zr * zi + ci;
+                zr = nzr; zi = nzi;
+                zr2 = zr * zr; zi2 = zi * zi;
+                i++;
+            }
+            return palette(i, maxIter, zr, zi);
+        }
+
+        private static int palette(int iter, int maxIter, double zr, double zi) {
+            if (iter >= maxIter) return 0x000000; // inside set
+            double mu = iter - Math.log(Math.log(zr*zr + zi*zi)) / Math.log(2);
+            double t = Math.min(1.0, Math.max(0.0, mu / maxIter));
+            float hue = (float) (0.7 + 10.0 * t);
+            return Color.HSBtoRGB(hue, 0.8f, 1.0f);
+        }
+    }
+}
